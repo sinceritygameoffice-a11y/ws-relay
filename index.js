@@ -1,133 +1,109 @@
 const http = require('http');
-const net = require('net');
-const crypto = require('crypto');
+const https = require('https');
+const url = require('url');
 
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.SECRET || 'ctf2026';
 
-function encodeFrame(data, opcode) {
-  const payload = typeof data === 'string' ? Buffer.from(data) : data;
-  let header;
-  if (payload.length < 126) {
-    header = Buffer.alloc(2);
-    header[0] = 0x80 | opcode;
-    header[1] = payload.length;
-  } else if (payload.length < 65536) {
-    header = Buffer.alloc(4);
-    header[0] = 0x80 | opcode;
-    header[1] = 126;
-    header.writeUInt16BE(payload.length, 2);
-  } else {
-    header = Buffer.alloc(10);
-    header[0] = 0x80 | opcode;
-    header[1] = 127;
-    header.writeBigUInt64BE(BigInt(payload.length), 2);
+const server = http.createServer(async (req, res) => {
+  // Health check
+  if (req.url === '/' || req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    return res.end('OK');
   }
-  return Buffer.concat([header, payload]);
-}
 
-function decodeFrame(buf) {
-  if (buf.length < 2) return null;
-  const opcode = buf[0] & 0x0F;
-  const masked = (buf[1] & 0x80) !== 0;
-  let len = buf[1] & 0x7F;
-  let off = 2;
-  if (len === 126) { if (buf.length < 4) return null; len = buf.readUInt16BE(2); off = 4; }
-  else if (len === 127) { if (buf.length < 10) return null; len = Number(buf.readBigUInt64BE(2)); off = 10; }
-  const totalNeeded = off + (masked ? 4 : 0) + len;
-  if (buf.length < totalNeeded) return null;
-  let payload;
-  if (masked) {
-    const mask = buf.slice(off, off + 4); off += 4;
-    payload = Buffer.alloc(len);
-    for (let i = 0; i < len; i++) payload[i] = buf[off + i] ^ mask[i % 4];
-  } else {
-    payload = buf.slice(off, off + len);
+  // Relay: /relay/<secret>/<encoded-url>
+  const match = req.url.match(/^\/relay\/([^/]+)\/(.+)/);
+  if (!match || match[1] !== SECRET) {
+    res.writeHead(403);
+    return res.end('Forbidden');
   }
-  return { opcode, payload, rest: buf.slice(off + len) };
-}
 
-const server = http.createServer((req, res) => {
-  // Check if this is a WebSocket upgrade that Render forwarded as regular request
-  if (req.headers.upgrade && req.headers.upgrade.toLowerCase() === 'websocket') {
-    // Manually handle upgrade
-    handleUpgrade(req, req.socket, Buffer.alloc(0));
-    return;
+  let targetUrl;
+  try {
+    targetUrl = decodeURIComponent(match[2]);
+  } catch {
+    res.writeHead(400);
+    return res.end('Bad URL');
   }
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('OK');
+
+  if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
+    res.writeHead(400);
+    return res.end('Invalid URL');
+  }
+
+  try {
+    const parsed = new URL(targetUrl);
+    const isHttps = parsed.protocol === 'https:';
+    const mod = isHttps ? https : http;
+
+    // Build headers
+    const headers = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (['host', 'connection', 'proxy-connection', 'proxy-authorization'].includes(k.toLowerCase())) continue;
+      headers[k] = v;
+    }
+    headers['host'] = parsed.host;
+
+    // Collect request body
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks);
+
+    const options = {
+      hostname: parsed.hostname,
+      port: parsed.port || (isHttps ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      method: req.method,
+      headers,
+      rejectUnauthorized: false,
+    };
+
+    const proxyReq = mod.request(options, (proxyRes) => {
+      // Copy response headers
+      const rh = {};
+      for (const [k, v] of Object.entries(proxyRes.headers)) {
+        if (['content-encoding', 'transfer-encoding', 'content-security-policy',
+             'x-frame-options', 'strict-transport-security'].includes(k.toLowerCase())) continue;
+        rh[k] = v;
+      }
+      rh['access-control-allow-origin'] = '*';
+      rh['access-control-allow-methods'] = 'GET, POST, PUT, DELETE, OPTIONS';
+
+      // Stream response
+      const resChunks = [];
+      proxyRes.on('data', c => resChunks.push(c));
+      proxyRes.on('end', () => {
+        const resBody = Buffer.concat(resChunks);
+        rh['content-length'] = resBody.length;
+        res.writeHead(proxyRes.statusCode, rh);
+        res.end(resBody);
+      });
+    });
+
+    proxyReq.on('error', (e) => {
+      console.log('[!] ' + e.message);
+      res.writeHead(502);
+      res.end('Relay error: ' + e.message);
+    });
+
+    proxyReq.setTimeout(30000, () => { proxyReq.destroy(); });
+
+    if (body.length > 0) proxyReq.write(body);
+    proxyReq.end();
+
+  } catch (e) {
+    res.writeHead(500);
+    res.end('Error: ' + e.message);
+  }
 });
 
-server.on('upgrade', handleUpgrade);
+server.listen(PORT, () => {
+  console.log('[+] HTTP Relay on port ' + PORT);
+});
 
-function handleUpgrade(req, socket, head) {
-  if (!req.url.includes(SECRET)) {
-    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-    socket.destroy();
-    return;
+process.on('uncaughtException', (e) => {
+  if (e.code !== 'ECONNRESET' && e.code !== 'EPIPE') {
+    console.log('[!] ' + e.message);
   }
-
-  const key = req.headers['sec-websocket-key'];
-  if (!key) { socket.destroy(); return; }
-
-  const accept = crypto.createHash('sha1')
-    .update(key + '258EAFA5-E914-47DA-95CA-5AB5DC11E65A')
-    .digest('base64');
-
-  socket.write(
-    'HTTP/1.1 101 Switching Protocols\r\n' +
-    'Upgrade: websocket\r\n' +
-    'Connection: Upgrade\r\n' +
-    'Sec-WebSocket-Accept: ' + accept + '\r\n' +
-    '\r\n'
-  );
-
-  let remote = null;
-  let wsBuf = Buffer.alloc(0);
-
-  socket.on('data', (chunk) => {
-    wsBuf = Buffer.concat([wsBuf, chunk]);
-    while (true) {
-      const frame = decodeFrame(wsBuf);
-      if (!frame) break;
-      wsBuf = frame.rest;
-
-      if (frame.opcode === 0x8) {
-        if (remote) remote.destroy();
-        socket.destroy();
-        return;
-      }
-      if (frame.opcode === 0x9) {
-        socket.write(encodeFrame(frame.payload, 0xA));
-        continue;
-      }
-
-      if (!remote) {
-        const target = frame.payload.toString();
-        console.log('[+] Raw target:', JSON.stringify(target), 'opcode:', frame.opcode);
-        const colonIdx = target.lastIndexOf(':');
-        const host = target.substring(0, colonIdx);
-        const port = parseInt(target.substring(colonIdx + 1));
-        console.log('[+] Connect ' + host + ':' + port);
-
-        remote = net.connect(port, host, () => {
-          socket.write(encodeFrame('OK', 0x1));
-        });
-        remote.on('data', (data) => {
-          try { socket.write(encodeFrame(data, 0x2)); } catch {}
-        });
-        remote.on('error', (e) => {
-          try { socket.write(encodeFrame('ERR:' + e.message, 0x1)); socket.destroy(); } catch {}
-        });
-        remote.on('close', () => { try { socket.destroy(); } catch {} });
-      } else {
-        try { remote.write(frame.payload); } catch {}
-      }
-    }
-  });
-
-  socket.on('close', () => { if (remote) remote.destroy(); });
-  socket.on('error', () => { if (remote) remote.destroy(); });
-}
-
-server.listen(PORT, () => { console.log('[+] Relay on port ' + PORT); });
+});
