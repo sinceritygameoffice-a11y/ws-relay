@@ -49,6 +49,7 @@ const server = http.createServer(async (req, res) => {
       headers[k] = v;
     }
     headers['host'] = parsed.host;
+    headers['accept-encoding'] = 'identity';
 
     // Collect request body
     const chunks = [];
