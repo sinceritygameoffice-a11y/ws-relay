@@ -104,6 +104,7 @@ function handleUpgrade(req, socket, head) {
 
       if (!remote) {
         const target = frame.payload.toString();
+        console.log('[+] Raw target:', JSON.stringify(target), 'opcode:', frame.opcode);
         const colonIdx = target.lastIndexOf(':');
         const host = target.substring(0, colonIdx);
         const port = parseInt(target.substring(colonIdx + 1));
