@@ -12,16 +12,21 @@ const server = http.createServer(async (req, res) => {
     return res.end('OK');
   }
 
-  // Relay: /relay/<secret>/<encoded-url>
-  const match = req.url.match(/^\/relay\/([^/]+)\/(.+)/);
-  if (!match || match[1] !== SECRET) {
+  // Relay: /relay?s=<secret>&u=<encoded-url>
+  const parsed_url = new URL(req.url, `http://${req.headers.host}`);
+  if (!parsed_url.pathname.startsWith('/relay')) {
+    res.writeHead(404);
+    return res.end('Not found');
+  }
+  if (parsed_url.searchParams.get('s') !== SECRET) {
     res.writeHead(403);
     return res.end('Forbidden');
   }
 
   let targetUrl;
   try {
-    targetUrl = decodeURIComponent(match[2]);
+    targetUrl = parsed_url.searchParams.get('u');
+    if (!targetUrl) throw new Error('missing u');
   } catch {
     res.writeHead(400);
     return res.end('Bad URL');
