@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: study-relay
+    runtime: node
+    buildCommand: echo "ok"
+    startCommand: node index.js
+    envVars:
+      - key: SECRET
+        value: ctf2026
